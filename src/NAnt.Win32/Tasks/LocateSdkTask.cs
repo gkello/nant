@@ -50,6 +50,8 @@ namespace NAnt.Win32.Tasks {
         private string _maxNetFxVer;
         private readonly string _registryBase = @"SOFTWARE\Microsoft\Microsoft SDKs\Windows";
         private readonly string _registryBaseWow6432 = @"SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\Windows";
+        private readonly string _registryBaseNetFx = @"SOFTWARE\Microsoft\Microsoft SDKs\NETFXSDK";
+        private readonly string _registryBaseNetFxWow6432 = @"SOFTWARE\Wow6432Node\Microsoft\Microsoft SDKs\NETFXSDK";
         private readonly string _regexNetFxTools = @"^WinSDK.*NetFx.*Tools.*$";
         
         #endregion Private Instance Fields
@@ -120,6 +122,21 @@ namespace NAnt.Win32.Tasks {
         /// locate the most recent WinSDK installed
         /// </summary>
         protected override void ExecuteTask() {
+            bool sdkFound = LoadNetFxSdk();
+            if (!sdkFound) {
+                sdkFound = LoadWindowsSdk();
+            }
+            // if the Properties dictionary does not contain the _propName as a key, throw an error.
+            if (!sdkFound) {
+                throw new BuildException(String.Format(CultureInfo.InvariantCulture,"System does not have minimum specified Windows SDK {0}!", _minWinSdkVer));
+            }
+        }
+
+        #endregion Override implementation of Task
+
+        #region Private Instance Methods
+
+        private bool LoadWindowsSdk() {
             // Initialize all necessary Version objects
             // These will hold the min, max, and loop WinSDK versions found
             Version minSdkVersion = StringToVersion(_minWinSdkVer);
@@ -264,17 +281,164 @@ namespace NAnt.Win32.Tasks {
                     }
                 }
             }
+            return sdkFound;
+        }
+        
+        private bool LoadNetFxSdk() {
+            // Initialize all necessary Version objects
+            // These will hold the min, max, and loop WinSDK versions found
+            Version minSdkVersion = StringToVersion(_minWinSdkVer);
+            Version maxSdkVersion = StringToVersion(_maxWinSdkVer);
+            Version loopSdkVersion = null;
             
-            // if the Properties dictionary does not contain the _propName as a key, throw an error.
-            if (!sdkFound) {
-                throw new BuildException(String.Format(CultureInfo.InvariantCulture,"System does not have minimum specified Windows SDK {0}!", _minWinSdkVer));
+            // These will hold the min, max, and loop .NET versions found
+            Version minNetVersion = StringToVersion(_minNetFxVer);
+            Version maxNetVersion = StringToVersion(_maxNetFxVer);
+            Version loopNetVersion = null;
+            
+            // Bool variable used to indicate that a valid SDK was found
+            bool sdkFound = false;
+            
+            // Get all of the WinSDK version keys from the user's registry and
+            // load them into a string list. In 64 bit process, consider 32 bit
+            // registry subkey as well
+            List<string> installedNetFxSdkVersions = new List<string>();
+            RegistryKey sdkRegSubKey = Registry.LocalMachine.OpenSubKey(_registryBaseNetFx, false);
+            if (sdkRegSubKey != null) {
+                installedNetFxSdkVersions.AddRange(sdkRegSubKey.GetSubKeyNames());
             }
+
+            RegistryKey sdkRegSubKey_x86 = null;
+            bool is64BitProcess = IntPtr.Size == 8;
+            if (is64BitProcess)
+            {
+                sdkRegSubKey_x86 = Registry.LocalMachine.OpenSubKey(_registryBaseNetFxWow6432, false);
+                if (sdkRegSubKey_x86 != null)
+                    foreach (string installedNetFxSdkVersionX86 in sdkRegSubKey_x86.GetSubKeyNames())
+                        if (!installedNetFxSdkVersions.Contains(installedNetFxSdkVersionX86))
+                            installedNetFxSdkVersions.Add(installedNetFxSdkVersionX86);
+            }
+            
+            // Sort and reverse the WinSDK version key array to make sure that
+            // the latest version is reviewed first before reviewing earlier
+            // versions.
+            installedNetFxSdkVersions.Sort();
+            installedNetFxSdkVersions.Reverse();
+            
+            // Loop through all of the WinSDK version keys.
+            for(int i = 0; i < installedNetFxSdkVersions.Count; i++) {
+                loopSdkVersion = StringToVersion("NETFX" + installedNetFxSdkVersions[i]);
+                
+                // If a maxVersion was indicated and the loopVersion is greater than
+                // the maxVersion, skip to the next item in the installedVersion array.
+                if (maxSdkVersion != null) {
+                    if (loopSdkVersion > maxSdkVersion) {
+                        continue;
+                    }
+                }
+                
+                // If the loopVersion is greater than or equal to the minVersion, loop through the subkeys
+                // for a valid .NET sdk path
+                if (minSdkVersion <= loopSdkVersion) {
+                    List<string> installedNetFxSdkSubKeys = new List<string>();
+                    RegistryKey sdkVerRegSubKey = null;
+                    if (sdkRegSubKey != null) {
+                        sdkVerRegSubKey = sdkRegSubKey.OpenSubKey(installedNetFxSdkVersions[i]);
+                        // Gets all of the current WinSdk loop subkeys
+                        if (sdkVerRegSubKey != null)
+                            installedNetFxSdkSubKeys.AddRange(sdkVerRegSubKey.GetSubKeyNames());
+                    }
+                    RegistryKey sdkVerRegSubKey_x86 = null;
+                    if (sdkRegSubKey_x86 != null) {
+                        sdkVerRegSubKey_x86 = sdkRegSubKey_x86.OpenSubKey(installedNetFxSdkVersions[i]);
+                        if (sdkVerRegSubKey_x86 != null) {
+                            foreach (string installedWinSdkSubKey in sdkVerRegSubKey_x86.GetSubKeyNames())
+                                if (!installedNetFxSdkSubKeys.Contains(installedWinSdkSubKey))
+                                    installedNetFxSdkSubKeys.Add(installedWinSdkSubKey);
+                        }
+                    }
+
+                    // Sort and reverse the order of the subkeys to go from greatest to least
+                    installedNetFxSdkSubKeys.Sort();
+                    installedNetFxSdkSubKeys.Reverse();
+                    
+                    // Loop through all of the current WinSdk loop subkeys
+                    for(int j = 0; j < installedNetFxSdkSubKeys.Count; j++) {
+                        // Check to see if the current subkey matches the RegEx string
+                        if (Regex.IsMatch(installedNetFxSdkSubKeys[j], _regexNetFxTools)) {
+                            // Initialize the necessary string array to hold all 
+                            // possible directory locations
+                            // From Wow6432Node last so that value for 64 bit registry is used first
+                            List<string> netFxDirs = new List<string>();
+
+                            if (sdkVerRegSubKey != null) {
+                                RegistryKey winSdkRegKey = sdkVerRegSubKey.OpenSubKey(installedNetFxSdkSubKeys[j]);
+                                if (winSdkRegKey != null) {
+                                    string installDir = winSdkRegKey.GetValue("InstallationFolder").ToString();
+                                    netFxDirs.Add(installDir);
+                                    netFxDirs.Add(Path.Combine(installDir, "bin"));
+                                }
+                            }
+                            if (sdkVerRegSubKey_x86 != null) {
+                              RegistryKey winSdkRegKey = sdkVerRegSubKey_x86.OpenSubKey(installedNetFxSdkSubKeys[j]);
+                              if (winSdkRegKey != null) {
+                                string installDir = winSdkRegKey.GetValue("InstallationFolder").ToString();
+                                netFxDirs.Add(installDir);
+                                netFxDirs.Add(Path.Combine(installDir, "bin"));
+                              }
+                            }
+                            
+                            // Loop through all of the directories in the possible directory
+                            // locations array
+                            foreach(string netFxDir in netFxDirs) {
+                                // Set the full path to the gacutil.exe.config file based on the current
+                                // directory in the directories array
+                                string netFxXmlFile = Path.Combine(netFxDir, "gacutil.exe.config");
+                            
+                                // If the full file path exists, load the gacutil.exe.config xml file
+                                if (File.Exists(netFxXmlFile)) {
+                                    XmlDocument gacXmlDoc = new XmlDocument();
+                                    gacXmlDoc.Load(netFxXmlFile);
+                                    
+                                    // Get the supported runtime version from the version attribute
+                                    // and load it into the loopNetVersion Version object to use for
+                                    // comparisons
+                                    XmlNode gacVersion = gacXmlDoc.SelectSingleNode("/configuration/startup/requiredRuntime");
+                                    XmlAttribute versionAttribute = gacVersion.Attributes["version"];
+                                    loopNetVersion = StringToVersion(versionAttribute.Value.ToString());
+                                    
+                                    // If the maxNetVersion object is not null and is less than
+                                    // the loopNetVersion, continue to the next iteration of the 
+                                    // inner loop
+                                    if (maxNetVersion != null) {
+                                        if (loopNetVersion > maxNetVersion) {
+                                            continue;
+                                        }
+                                    }
+                                    
+                                    // If loopNetVersion is greater than or equal to minNetVersion
+                                    // assign the value of the InstallationFolder key of the current subfolder
+                                    // to the property name and exit the inner loop
+                                    if (minNetVersion <= loopNetVersion) {
+                                        Properties[_propName] = netFxDir;
+                                        sdkFound = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // If a valid Sdk version was found within the current Sdk subkeys, break
+                    // the outer loop.
+                    if (sdkFound) {
+                        break;
+                    }
+                }
+            }
+            return sdkFound;
         }
 
-        #endregion Override implementation of Task
-
-        #region Private Instance Methods
-        
         /// <summary>
         /// Converts a version expressed as a string into a Version object 
         /// </summary>
@@ -294,6 +458,12 @@ namespace NAnt.Win32.Tasks {
                     sdkVersion = sdkVersion.Substring(1);
                 }
                 
+                // WinSdk will be 1.xx.yy.a, NetFx 2.xx.yy.a
+                if (sdkVersion.StartsWith("NETFX")) {
+                    sdkVersion = "2." + sdkVersion.Substring(5);
+                } else {
+                    sdkVersion = "1." + sdkVersion;
+                }
                 // Return a new Version object based on the sdkVersion string
                 // If the sdkVersion string ends with an alphanumeric, it is
                 // converted to a revision number for comparison purposes
@@ -309,7 +479,6 @@ namespace NAnt.Win32.Tasks {
                 return null;
             }
         }
-
         #endregion Private Instance Methods
     }
 }
